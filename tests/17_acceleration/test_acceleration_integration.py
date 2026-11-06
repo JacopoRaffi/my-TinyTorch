@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""
+Integration tests for Module 17: Acceleration.
+
+Every acceleration technique in this module is an optimization, which means its
+one non-negotiable property is that it does not change the answer. These tests
+pin each fast path to a reference computation.
+"""
+
+import numpy as np
+
+from tinytorch.core.tensor import Tensor
+from tinytorch.perf.acceleration import (
+    vectorized_matmul,
+    tiled_matmul,
+    fused_gelu,
+    unfused_gelu,
+    im2col,
+    im2col_conv2d,
+    col2im,
+    Im2colConv2dFunction,
+)
+
+
+def test_vectorized_matmul_matches_the_reference_product():
+    rng = np.random.default_rng(0)
+    a_data = rng.standard_normal((17, 23)).astype(np.float32)
+    b_data = rng.standard_normal((23, 11)).astype(np.float32)
+
+    actual = vectorized_matmul(Tensor(a_data), Tensor(b_data))
+    expected = a_data @ b_data
+
+    assert actual.data.shape == expected.shape, (
+        f"Shape mismatch: {actual.data.shape} vs {expected.shape}"
+    )
+    np.testing.assert_allclose(actual.data, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_tiled_matmul_agrees_at_every_tile_size():
+    """Tiling changes the summation order, not the result."""
+    rng = np.random.default_rng(1)
+    a_data = rng.standard_normal((40, 40)).astype(np.float32)
+    b_data = rng.standard_normal((40, 40)).astype(np.float32)
+    expected = a_data @ b_data
+
+    for tile_size in (8, 16, 32, 64):
+        actual = tiled_matmul(Tensor(a_data), Tensor(b_data), tile_size=tile_size)
+        assert actual.data.shape == expected.shape, (
+            f"tile_size={tile_size} changed the output shape"
+        )
+        # float32 reassociation tolerance, scaled by the reduction depth.
+        np.testing.assert_allclose(
+            actual.data, expected, rtol=1e-4, atol=1e-4,
+            err_msg=f"tiled_matmul disagreed with the reference at tile_size={tile_size}",
+        )
+
+
+def test_tiled_matmul_handles_a_partial_final_tile():
+    """A size that is not a multiple of the tile is where tiling bugs hide."""
+    rng = np.random.default_rng(2)
+    a_data = rng.standard_normal((13, 7)).astype(np.float32)
+    b_data = rng.standard_normal((7, 5)).astype(np.float32)
+
+    actual = tiled_matmul(Tensor(a_data), Tensor(b_data), tile_size=4)
+    np.testing.assert_allclose(actual.data, a_data @ b_data, rtol=1e-4, atol=1e-4)
+
+
+def test_fusion_does_not_change_the_activation():
+    """The fused and unfused GELU must be the same function."""
+    rng = np.random.default_rng(3)
+    x = Tensor(rng.standard_normal((64, 32)).astype(np.float32) * 2.0)
+
+    fused = fused_gelu(x)
+    unfused = unfused_gelu(x)
+
+    assert fused.data.shape == x.data.shape, "fused_gelu changed the shape"
+    np.testing.assert_allclose(
+        fused.data, unfused.data, rtol=1e-5, atol=1e-5,
+        err_msg="fused_gelu and unfused_gelu computed different functions",
+    )
+
+    # GELU is not the identity and not ReLU; a stub returning either would
+    # otherwise pass a shape-only check.
+    assert not np.allclose(fused.data, x.data), "fused_gelu returned its input unchanged"
+    assert not np.allclose(fused.data, np.maximum(x.data, 0)), (
+        "fused_gelu returned ReLU, not GELU"
+    )
+    # GELU sends small negatives slightly negative, unlike ReLU which zeroes them.
+    assert float(fused_gelu(Tensor(np.array([-0.5], dtype=np.float32))).data[0]) < 0.0
+
+
+def test_im2col_conv2d_agrees_with_the_loops_at_every_stride_and_padding():
+    """im2col schedules the multiply-adds differently; the answer must not move."""
+    from tinytorch.core.spatial import Conv2d
+
+    rng = np.random.default_rng(4)
+    x = Tensor(rng.standard_normal((2, 3, 9, 9)).astype(np.float32))
+
+    for stride, padding in ((1, 0), (1, 1), (2, 0), (2, 1)):
+        conv = Conv2d(3, 4, kernel_size=3, stride=stride, padding=padding)
+        conv.bias.data[:] = rng.standard_normal(4)
+        fast = im2col_conv2d(x, conv.weight, conv.bias, stride=stride, padding=padding)
+        reference = conv(x)
+        assert fast.data.shape == reference.data.shape, (
+            f"stride={stride}, padding={padding} changed the output shape"
+        )
+        np.testing.assert_allclose(
+            fast.data, reference.data, rtol=1e-5, atol=1e-5,
+            err_msg=f"im2col_conv2d disagreed with Conv2d at stride={stride}, padding={padding}",
+        )
+
+
+def test_im2col_rows_are_the_patches_under_the_kernel():
+    """A stub that returns the right shape with the wrong pixels must fail."""
+    x = Tensor(np.arange(16, dtype=np.float32).reshape(1, 1, 4, 4))
+    cols = im2col(x, kernel_size=2, stride=2)
+    np.testing.assert_array_equal(cols.data, [[0, 1, 4, 5],
+                                              [2, 3, 6, 7],
+                                              [8, 9, 12, 13],
+                                              [10, 11, 14, 15]])
+
+
+def test_col2im_is_the_transpose_of_im2col():
+    """<im2col(x), c> == <x, col2im(c)> for every x and c: the definition of a transpose."""
+    rng = np.random.default_rng(5)
+    for stride, padding in ((1, 0), (2, 1)):
+        x = rng.standard_normal((2, 2, 6, 6))
+        cols = im2col(Tensor(x), kernel_size=3, stride=stride, padding=padding).data
+        c = rng.standard_normal(cols.shape)
+        back = col2im(Tensor(c), x.shape, kernel_size=3, stride=stride, padding=padding).data
+        np.testing.assert_allclose(np.sum(cols * c), np.sum(x * back), rtol=1e-4)
+
+
+def test_im2col_function_gradients_match_conv2d_backward():
+    """The training path must produce the loops' gradients, not just their output."""
+    from tinytorch.core.spatial import Conv2d
+
+    rng = np.random.default_rng(6)
+    conv = Conv2d(2, 3, kernel_size=3, stride=2, padding=1)
+    x_data = rng.standard_normal((2, 2, 7, 7)).astype(np.float32)
+
+    x_ref = Tensor(x_data, requires_grad=True)
+    conv(x_ref).sum().backward()
+
+    x = Tensor(x_data, requires_grad=True)
+    w = Tensor(conv.weight.data.copy(), requires_grad=True)
+    b = Tensor(conv.bias.data.copy(), requires_grad=True)
+    Im2colConv2dFunction.apply(x, w, b, stride=2, padding=1).sum().backward()
+
+    as_array = lambda g: np.asarray(getattr(g, "data", g))
+    for name, got, ref in (("input", x.grad, x_ref.grad), ("weight", w.grad, conv.weight.grad),
+                           ("bias", b.grad, conv.bias.grad)):
+        np.testing.assert_allclose(as_array(got), as_array(ref), rtol=1e-4, atol=1e-4,
+                                   err_msg=f"{name} gradient differs from Conv2d")
+
+
+if __name__ == "__main__":
+    test_vectorized_matmul_matches_the_reference_product()
+    test_tiled_matmul_agrees_at_every_tile_size()
+    test_tiled_matmul_handles_a_partial_final_tile()
+    test_fusion_does_not_change_the_activation()
+    test_im2col_conv2d_agrees_with_the_loops_at_every_stride_and_padding()
+    test_im2col_rows_are_the_patches_under_the_kernel()
+    test_col2im_is_the_transpose_of_im2col()
+    test_im2col_function_gradients_match_conv2d_backward()
+    print("✅ Acceleration integration tests passed")
+
+
+def test_tiling_rejects_noninteger_block_size():
+    import pytest
+    with pytest.raises(ValueError):
+        tiled_matmul(Tensor([[1.]]), Tensor([[2.]]), tile_size=1.5)
