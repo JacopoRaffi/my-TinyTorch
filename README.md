@@ -1,3 +1,5 @@
+> **Acknowledgment:** This repository tracks my personal solutions and progress through the TinyTorch curriculum. The original project, course structure, and base framework were created by [Harvard Edge](https://github.com/harvard-edge). You can find the original, official repository [here](https://github.com/harvard-edge/cs249r_book).
+
 <div align="center">
 
 # Tiny🔥Torch
